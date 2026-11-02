@@ -1,0 +1,19 @@
+# Keep the build context small. models/ and config.yaml must stay in it.
+.git
+.github
+.claude
+.venv
+.pytest_cache
+__pycache__
+*.pyc
+.DS_Store
+tests
+docs
+data
+optional
+static
+*.md
+TODO.MD
+check.jpg
+check.png
+check_boxes.py

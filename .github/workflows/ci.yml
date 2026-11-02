@@ -1,0 +1,237 @@
+# CI: unit tests, then (when configured) download model, build image,
+# integration tests against the running container, and push to Docker Hub.
+# CI ends once the image is pushed. Deploying is a per-project step.
+#
+# The model comes from config.yaml: CI downloads model.url to model.path.
+#
+# Configuration (Settings > Secrets and variables > Actions):
+# | Name               | Kind                | Purpose                                          |
+# |--------------------|---------------------|--------------------------------------------------|
+# | MODEL_URL          | repository variable | Optional. Overrides model.url from config.yaml   |
+# | DOCKERHUB_USERNAME | secret              | Registry username                                |
+# | DOCKERHUB_TOKEN    | secret              | Registry access token                            |
+#
+# No model URL anywhere: unit tests only, run is green, the job summary says what to set.
+# Model URL, no registry secrets: also download, build, and integration tests. Push is skipped.
+# Everything set, push to main: full run, image pushed as <user>/<repo>:<sha> and :latest.
+# Pull requests never push.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    env:
+      # HAS_MODEL is set by the "Resolve model" step, since it needs config.yaml
+      HAS_REGISTRY: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
+      CAN_PUSH: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      CONTAINER: model-service
+      SHA: ${{ github.sha }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+
+      - name: Unit tests
+        id: unit
+        run: |
+          set -euo pipefail
+          pip install -r requirements.txt -r requirements-dev.txt
+          pytest tests/unit -v
+
+      # Reads model.url and model.path from config.yaml. The MODEL_URL
+      # repository variable, when set, overrides model.url.
+      - name: Resolve model
+        id: model
+        env:
+          MODEL_URL_OVERRIDE: ${{ vars.MODEL_URL }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os, sys, urllib.parse, yaml
+
+          model = (yaml.safe_load(open("config.yaml")) or {}).get("model") or {}
+          path = str(model.get("path", "models/model.onnx"))
+          override = os.environ.get("MODEL_URL_OVERRIDE", "").strip()
+          url = override or str(model.get("url") or "").strip()
+          source = "repository variable MODEL_URL" if override else "model.url in config.yaml"
+
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              if not url:
+                  env.write("HAS_MODEL=false\n")
+                  print("No model URL: set model.url in config.yaml. Build and integration tests will be skipped.")
+                  sys.exit(0)
+              if "\n" in url:
+                  sys.exit(f"::error::Check {source}: it must be a single-line URL.")
+              print(f"::add-mask::{url}")
+              if not path.startswith("models/"):
+                  sys.exit(f"::error::model.path in config.yaml is '{path}'. The Dockerfile "
+                           "only copies models/, so model.path must start with models/.")
+              env.write(f"HAS_MODEL=true\nMODEL_PATH={path}\nMODEL_URL={url}\nMODEL_SOURCE={source}\n")
+          print(f"Model {path} from {source} (host {urllib.parse.urlparse(url).hostname or 'invalid URL'})")
+          PY
+
+      - name: Download model
+        id: download
+        if: env.HAS_MODEL == 'true'
+        run: |
+          set -euo pipefail
+          echo "Downloading to $MODEL_PATH"
+          mkdir -p "$(dirname "$MODEL_PATH")"
+          if ! wget -nv --tries=3 --timeout=60 -O "$MODEL_PATH" "$MODEL_URL"; then
+            echo "::error::Model download failed. Check $MODEL_SOURCE: it must be a public, direct download link to the .onnx file."
+            exit 1
+          fi
+
+          SIZE=$(stat -c %s "$MODEL_PATH")
+          if [ "$SIZE" -lt 1024 ]; then
+            echo "::error::Downloaded file is only $SIZE bytes, not a model. Check $MODEL_SOURCE: it likely points to an error page instead of the .onnx file."
+            exit 1
+          fi
+          # process substitution, not a pipe: with pipefail, grep -q exiting early can mask a match
+          if LC_ALL=C grep -aqiE '<!doctype html|<html' <(head -c 1024 "$MODEL_PATH"); then
+            echo "::error::Downloaded file is an HTML page, not a model. Check $MODEL_SOURCE: use the direct file link (for example a Hugging Face resolve/main/... URL), not the page that shows the file."
+            exit 1
+          fi
+          echo "Model downloaded: $SIZE bytes"
+
+      - name: Build image
+        id: build
+        if: env.HAS_MODEL == 'true'
+        env:
+          REGISTRY_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          set -euo pipefail
+          if [ "$HAS_REGISTRY" = "true" ]; then
+            IMAGE="$REGISTRY_USER/${GITHUB_REPOSITORY#*/}"
+          else
+            IMAGE="model-service"
+          fi
+          IMAGE=$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          docker build -t "$IMAGE:$SHA" -t "$IMAGE:latest" .
+
+      - name: Integration tests
+        id: integration
+        if: env.HAS_MODEL == 'true'
+        run: |
+          set -euo pipefail
+          docker run -d -p 8000:8000 --name "$CONTAINER" "$IMAGE:$SHA"
+
+          echo "Waiting for /ping (up to 120s)"
+          deadline=$((SECONDS + 120))
+          until curl -sf --max-time 5 http://localhost:8000/ping > /dev/null; do
+            if [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER")" != "true" ]; then
+              echo "::error::Container exited before becoming ready. See the container logs below."
+              docker logs "$CONTAINER" || true
+              exit 1
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::/ping did not return 200 within 120s. setup_errors in /health below say what to fix."
+              curl -s --max-time 5 http://localhost:8000/health || true
+              echo
+              docker logs "$CONTAINER" || true
+              exit 1
+            fi
+            sleep 3
+          done
+          echo "Ready after $((SECONDS - deadline + 120))s"
+
+          echo "/health:"
+          curl -s --max-time 5 http://localhost:8000/health
+          echo
+
+          BASE_URL=http://localhost:8000 pytest tests/integration -v
+
+      - name: Print container logs
+        if: failure() && env.HAS_MODEL == 'true'
+        run: docker logs "$CONTAINER" || true
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker stop "$CONTAINER" > /dev/null 2>&1 || true
+          docker rm "$CONTAINER" > /dev/null 2>&1 || true
+
+      - name: Log in to Docker Hub
+        if: env.HAS_MODEL == 'true' && env.CAN_PUSH == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Push image
+        id: push
+        if: env.HAS_MODEL == 'true' && env.CAN_PUSH == 'true'
+        run: |
+          set -euo pipefail
+          docker push "$IMAGE:$SHA"
+          docker push "$IMAGE:latest"
+          echo "PUSHED=$IMAGE:$SHA" >> "$GITHUB_ENV"
+
+      - name: Summary
+        if: always()
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          UNIT: ${{ steps.unit.outcome }}
+          MODEL: ${{ steps.model.outcome }}
+          DOWNLOAD: ${{ steps.download.outcome }}
+          BUILD: ${{ steps.build.outcome }}
+          INTEGRATION: ${{ steps.integration.outcome }}
+          PUSH: ${{ steps.push.outcome }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## CI summary"
+            echo
+            echo "| Stage | Result |"
+            echo "|---|---|"
+            echo "| Unit tests | ${UNIT:-not run} |"
+            echo "| Resolve model | ${MODEL:-not run} |"
+            echo "| Download model | ${DOWNLOAD:-not run} |"
+            echo "| Build image | ${BUILD:-not run} |"
+            echo "| Integration tests | ${INTEGRATION:-not run} |"
+            echo "| Push image | ${PUSH:-not run} |"
+            echo
+
+            HAS_MODEL="${HAS_MODEL:-false}"
+            if [ "$HAS_MODEL" = "true" ]; then
+              echo "- Model: \`$MODEL_PATH\` from $MODEL_SOURCE."
+            elif [ "${MODEL:-}" = "success" ]; then
+              echo "- Build and integration tests skipped: model.url is not set in config.yaml. Set it to a direct download link to your .onnx file."
+            fi
+
+            if [ "$EVENT" = "pull_request" ]; then
+              echo "- Push skipped: pull requests never push."
+            elif [ "$REF" != "refs/heads/main" ]; then
+              echo "- Push skipped: only pushes to main push the image."
+            elif [ "$HAS_REGISTRY" != "true" ]; then
+              echo "- Push skipped: DOCKERHUB_USERNAME and DOCKERHUB_TOKEN secrets are not set (both are required)."
+            elif [ "$HAS_MODEL" != "true" ]; then
+              echo "- Push skipped: no image was built because model.url is not set in config.yaml."
+            fi
+
+            if [ -n "${PUSHED:-}" ]; then
+              echo "- Pushed \`$PUSHED\` and \`$IMAGE:latest\`. Deploy the SHA tag."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
