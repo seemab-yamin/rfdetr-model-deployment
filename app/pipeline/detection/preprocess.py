@@ -8,8 +8,6 @@ from app.pipeline.base import PipelineError
 
 logger = logging.getLogger(__name__)
 
-PAD_VALUE = 114  # YOLO standard gray
-
 
 @dataclass(frozen=True)
 class ImageSpec:
@@ -21,12 +19,9 @@ class ImageSpec:
 
 
 @dataclass(frozen=True)
-class LetterboxContext:
+class ResizeContext:
     orig_w: int
     orig_h: int
-    scale: float
-    pad_x: int
-    pad_y: int
 
 
 def _fixed(dim) -> bool:
@@ -70,29 +65,32 @@ def resolve_image_spec(tensor, configured_size: tuple[int, int]) -> ImageSpec:
     return ImageSpec(tensor.name, channels, height, width, layout)
 
 
-def letterbox(
+def resize(
     image: Image.Image, height: int, width: int
-) -> tuple[np.ndarray, LetterboxContext]:
-    """Resize keeping aspect ratio, pad the rest with gray, center the image."""
+) -> tuple[np.ndarray, ResizeContext]:
+    """Stretch to the model size without padding, as RF-DETR (and DETR) expect."""
     image = image.convert("RGB")
     w, h = image.size
-    scale = min(width / w, height / h)
-    new_w, new_h = round(w * scale), round(h * scale)
-    resized = image.resize((new_w, new_h), Image.BILINEAR)
-
-    canvas = np.full((height, width, 3), PAD_VALUE, dtype=np.uint8)
-    pad_x, pad_y = (width - new_w) // 2, (height - new_h) // 2
-    canvas[pad_y : pad_y + new_h, pad_x : pad_x + new_w] = np.asarray(resized)
-    return canvas, LetterboxContext(w, h, scale, pad_x, pad_y)
+    resized = image.resize((width, height), Image.BILINEAR)
+    return np.asarray(resized), ResizeContext(w, h)
 
 
 def to_tensor(
-    canvas: np.ndarray, layout: str, channel_order: str, normalize: bool
+    canvas: np.ndarray,
+    layout: str,
+    channel_order: str,
+    normalize: bool,
+    mean: tuple[float, float, float] | None = None,
+    std: tuple[float, float, float] | None = None,
 ) -> np.ndarray:
     arr = canvas[..., ::-1] if channel_order == "BGR" else canvas
     arr = arr.astype(np.float32)
     if normalize:
         arr = arr / 255.0
+    if mean is not None:
+        arr = arr - np.asarray(mean, dtype=np.float32)
+    if std is not None:
+        arr = arr / np.asarray(std, dtype=np.float32)
     if layout == "NCHW":
         arr = arr.transpose(2, 0, 1)
     return np.ascontiguousarray(arr)[None]

@@ -1,44 +1,59 @@
-# fastapi-model-service
+# rfdetr-model-deployment
 
-A template for serving an ML model as a REST API. It includes a FastAPI server, Docker image, GitHub Actions CI, tests, and an AI skill that guides code generation.
+A GPU REST API for [RF-DETR](https://github.com/roboflow/rf-detr) object detection. It runs the RF-DETR Nano COCO model (ONNX export from [PierreMarieCurie/rf-detr-onnx](https://huggingface.co/PierreMarieCurie/rf-detr-onnx)) with ONNX Runtime CUDA, behind FastAPI, in a Docker image that CI builds, tests, and pushes to Docker Hub.
 
-It serves any ONNX model through a config-driven task pipeline. Out of the box, `config.yaml` points at a YOLOv8n object detector (`model.url`), which CI downloads and bakes into the image. Swap in another model by editing `config.yaml` and, if its input or output layout differs, the pipeline's pre- and postprocessing.
-
-## What you get
-
-- FastAPI server that loads the model once at startup and never crashes on bad setup: problems are listed in `/health`
-- Task pipeline registry (`app/pipeline/`) with a YOLOv8-style detection reference, on a task-agnostic ONNX runtime
-- `/predict` endpoint with input validation and a typed response
-- `/health` (info) and `/ping` (readiness) endpoints
-- Dockerfile that bakes the model into the image at build time (CI downloads it into `models/` first)
-- GitHub Actions: unit tests, model download, build, integration tests against the live container, push
+- `/predict` takes an image and returns COCO detections with boxes in original-image pixels
+- `/annotate` returns the same image with the boxes and labels drawn on it
+- The model is downloaded by CI and baked into the image, then loaded once at startup
+- Startup never crashes on bad setup: problems are listed in `/health`, and `/ping` stays 503 until the model is loaded
+- Docker image runs on NVIDIA GPUs (CUDA 12 and cuDNN 9 come as pip wheels, no CUDA base image needed), and falls back to the next available execution provider, ending with CPU, when no GPU is present
 - Images tagged with the commit SHA and `latest`
-- Unit tests and integration tests (integration tests skip unless `BASE_URL` is set)
-- A `SKILL.md` that tells an AI coding assistant how to adapt the template safely
 
-## Quick start
+## Run with Docker (GPU)
 
-1. Click **Use this template** on GitHub and name your new repo.
-2. Clone it and install dependencies (`requirements-dev.txt` adds the test tools):
+The host needs an NVIDIA driver and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
 
 ```bash
-pip install -r requirements.txt -r requirements-dev.txt
+docker run --gpus all -p 8000:8000 <dockerhub-user>/rfdetr-model-deployment:<sha>
 ```
 
-3. Download the model to `model.path` (models are not committed to git):
+Check that the GPU is in use. `model_io.providers` in `/health` should start with `CUDAExecutionProvider`:
 
 ```bash
-curl -fL -o models/yolov8n.onnx https://huggingface.co/Kalray/yolov8/resolve/main/yolov8n.onnx
+curl http://localhost:8000/health
 ```
 
-4. Run the server:
+If it only lists `CPUExecutionProvider`, the container cannot see the GPU (missing `--gpus all`, driver, or toolkit). The service still starts and serves on CPU, and the container log has a warning saying why. `requested_providers` shows what `config.yaml` asked for.
+
+To build the image yourself:
+
+```bash
+curl -fL -o models/rf-detr-nano.onnx https://huggingface.co/PierreMarieCurie/rf-detr-onnx/resolve/main/rf-detr-nano.onnx
+```
+
+```bash
+docker build -t rfdetr-model-deployment .
+```
+
+## Local development (CPU)
+
+`onnxruntime-gpu` has no macOS build, so local development and tests use the CPU runtime from `requirements-dev.txt`.
+
+```bash
+pip install -r requirements-dev.txt
+```
+
+```bash
+curl -fL -o models/rf-detr-nano.onnx https://huggingface.co/PierreMarieCurie/rf-detr-onnx/resolve/main/rf-detr-nano.onnx
+```
+
+`config.yaml` asks for CUDA first. The CPU runtime does not have it, so the service logs a warning, skips it, and runs on CPU:
 
 ```bash
 uvicorn app.main:app --reload
 ```
 
-5. Open `http://localhost:8000/docs` and try `/predict` with an image.
-6. Run the tests (no model file needed):
+Open `http://localhost:8000/docs` and try `/predict` with an image from `data/sample/`. Run the unit tests (no model file needed):
 
 ```bash
 pytest tests/unit -v
@@ -50,37 +65,44 @@ Without a model file the server still starts: `/ping` and `/predict` return 503,
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/health` | Liveness and info. Returns 200 when the process is up, with `status`, `model_loaded`, `model_path`, `model_io` (real input and output shapes), and `setup_errors`. |
+| GET | `/health` | Liveness and info. Returns 200 when the process is up, with `status`, `model_loaded`, `model_path`, `model_io` (input and output shapes, active `providers`, and the `requested_providers` from config), and `setup_errors`. |
 | GET | `/ping` | Readiness. Returns 503 until the model is loaded, then 200. Point platform health checks here. |
-| POST | `/predict` | Runs the model on an uploaded image (`multipart/form-data`, field `file`) and returns JSON. |
+| POST | `/predict` | Runs RF-DETR on an uploaded image (`multipart/form-data`, field `file`) and returns JSON. |
+| POST | `/annotate` | Same input as `/predict`. Returns the image with boxes and labels drawn on it. |
 
 ```bash
 curl http://localhost:8000/health
+```
+
+```bash
 curl http://localhost:8000/ping
 ```
 
 ### `/predict`
 
 ```bash
-curl -X POST "http://localhost:8000/predict" \
-  -F "file=@/path/to/image.jpg"
+curl -X POST "http://localhost:8000/predict" -F "file=@data/sample/bus.jpg"
 ```
 
-Response:
+Response (trimmed to two of five detections):
 
 ```json
 {
   "filename": "bus.jpg",
   "image": {"width": 810, "height": 1080},
-  "count": 1,
+  "count": 2,
   "detections": [
-    {"class_id": 5, "class": "bus", "confidence": 0.84, "bbox": [30.9, 231.2, 800.7, 777.7]}
+    {"class_id": 6, "class": "bus", "confidence": 0.953, "bbox": [9.4, 229.4, 806.8, 734.0]},
+    {"class_id": 1, "class": "person", "confidence": 0.948, "bbox": [50.6, 395.0, 245.7, 907.6]}
   ],
-  "inference_ms": 24.2
+  "inference_ms": 64.9
 }
 ```
 
-`bbox` is `[x1, y1, x2, y2]` in original-image pixels. No detections returns `count: 0` and an empty list with status 200. `inference_ms` covers the model pipeline only.
+- `bbox` is `[x1, y1, x2, y2]` in original-image pixels.
+- `class_id` is the COCO category id (1 = person, 6 = bus), as RF-DETR outputs it.
+- Detections are sorted by confidence. RF-DETR makes one prediction per query (300 queries), so there is no NMS step.
+- No detections returns `count: 0` and an empty list with status 200. `inference_ms` covers the model pipeline only (CPU timing above).
 
 | Status | Cause |
 |---|---|
@@ -91,50 +113,39 @@ Response:
 | 500 | Pipeline error (message says what to fix, for example a labels count mismatch) or an internal error (generic message, traceback in the server log) |
 | 503 | Model not loaded. The body has `setup_errors` listing what to fix |
 
-## Project structure
+### `/annotate`
 
+Runs the same detection and returns the uploaded image, in the same format, with boxes and `class confidence` labels drawn on it. Nothing is saved to disk.
+
+```bash
+curl -X POST "http://localhost:8000/annotate" -F "file=@data/sample/bus.jpg" -o annotated.jpg
 ```
-app/
-  main.py          # lifespan, app.state, setup_errors, router registration
-  config.py        # loads and validates config.yaml (unknown keys rejected)
-  routers/         # thin HTTP layer (health.py, predict.py)
-  pipeline/        # task registry: base.py, detection/ (preprocess.py, postprocess.py)
-  services/        # onnx_runtime.py: task-agnostic ONNX model wrapper
-  schemas/         # request and response models
-  utils/           # upload and image validation helpers
-config.yaml        # model and inference settings
-models/            # .onnx goes here (git keeps only .gitkeep)
-optional/annotate/ # opt-in /annotate route (not in the image until copied into app/)
-tests/
-  unit/            # run on every push, no model needed
-  integration/     # run against a live container, skip unless BASE_URL is set
-docs/first-time-setup.md
-Dockerfile
-.dockerignore
-requirements.txt       # runtime dependencies
-requirements-dev.txt   # test tools
-.github/workflows/ci.yml
-.claude/skills/fastapi-model-service/
-  SKILL.md
-  references/
-```
+
+The response `Content-Type` matches the upload (`image/jpeg`, `image/png`, or `image/webp`), and the `X-Detections-Count` header holds the number of boxes. Errors are the same as `/predict`. For the detections as JSON, call `/predict`.
+
+## How inference works
+
+1. **Preprocess** (`app/pipeline/detection/preprocess.py`): convert to RGB, resize to 384×384 without padding, scale to 0–1, subtract the ImageNet mean and divide by std, NCHW float32.
+2. **Model**: outputs `pred_boxes` `(1, 300, 4)` as normalized cx, cy, w, h, and `pred_logits` `(1, 300, 91)`.
+3. **Postprocess** (`app/pipeline/detection/postprocess.py`): sigmoid on the logits, best class per query, keep scores at or above `confidence_threshold`, sort by score, scale boxes to original-image pixels.
 
 ## Configuration
 
 Settings live in `config.yaml`. Each key is commented there, and unknown keys are rejected so typos fail loudly.
 
-| Key | Default in template | Meaning |
+| Key | Value | Meaning |
 |---|---|---|
-| `model.path` | `models/yolov8n.onnx` | Where the app loads the model. Must be under `models/` for the image |
-| `model.url` | YOLOv8n on Hugging Face | Direct link CI downloads to `model.path`. The app never downloads it |
-| `model.task` | `detection` | Pipeline to use from `app/pipeline/` |
-| `model.input_size` | `[640, 640]` | Height, width. Used only if the model input is dynamic |
+| `model.path` | `models/rf-detr-nano.onnx` | Where the app loads the model. Must be under `models/` for the image |
+| `model.url` | RF-DETR Nano on Hugging Face | Direct link CI downloads to `model.path`. The app never downloads it |
+| `model.task` | `detection` | Pipeline in `app/pipeline/` |
+| `model.input_size` | `[384, 384]` | Height, width. Used only if the model input is dynamic |
 | `model.channel_order` | `RGB` | `RGB` or `BGR` |
 | `model.normalize` | `true` | Divide pixel values by 255 |
-| `model.labels` | 80 COCO names | Class names in model order |
-| `inference.providers` | `[CPUExecutionProvider]` | ONNX Runtime execution providers |
-| `inference.confidence_threshold` | `0.25` | Minimum score to keep a detection |
-| `inference.iou_threshold` | `0.45` | NMS overlap threshold |
+| `model.mean` | ImageNet mean | Per-channel mean subtracted after `normalize` |
+| `model.std` | ImageNet std | Per-channel std divided after `mean` |
+| `model.labels` | 91 COCO names | Indexed by COCO category id, `N/A` for unused ids |
+| `inference.providers` | `[CUDAExecutionProvider, CPUExecutionProvider]` | ONNX Runtime execution providers, in priority order. Ones this build lacks are skipped, and CPU is always the last resort |
+| `inference.confidence_threshold` | `0.5` | Minimum score to keep a detection |
 | `inference.max_upload_mb` | `10` | `/predict` rejects larger uploads with 413 |
 
 Environment variables:
@@ -143,100 +154,81 @@ Environment variables:
 |---|---|---|
 | `PORT` | `8000` | Port the server listens on in the container |
 | `CONFIG_PATH` | `config.yaml` | Path to the config file |
+| `INFERENCE_PROVIDERS` | unset | Comma-separated override for `inference.providers`, for example `CPUExecutionProvider` to force CPU on a GPU host |
 
 Secrets (API keys, registry tokens) come from env vars or CI secrets. Never commit them and never bake them into the image.
 
-## Swap in a different model
+### Another RF-DETR size
 
-Change only these:
+The same Hugging Face repo has Small, Medium, Base, and larger exports. To switch, change `model.path` and `model.url` in `config.yaml`, and check `/health` `model_io` for the input size (for example Base is 560×560). Fixed model input sizes override `model.input_size` automatically. The COCO labels stay the same. Note that `rf-detr-xlarge` and `rf-detr-2xlarge` use Roboflow's PML-1.0 license, not Apache-2.0.
 
-- `config.yaml`: `model.path`, `model.url`, `model.labels`, `model.input_size`, `model.channel_order`, `model.normalize`, thresholds
-- `app/pipeline/<task>/preprocess.py`: if the model's input handling differs (resize, color order, scaling)
-- `app/pipeline/<task>/postprocess.py`: if the output layout differs from YOLOv8 (`(1, 4+classes, N)`)
-- `app/schemas/`: only if the response shape changes
-- `tests/`: update tests and fakes to match
+## Project structure
 
-Check `/health` `model_io` to see the model's real input and output shapes. For a new task type (NLP, tabular), see "Adding a new task" in `docs/first-time-setup.md`.
-
-Do not change the lifespan loading, the setup-errors flow, `app/services/onnx_runtime.py`, the readiness logic, or the workflow step order unless you have a clear reason.
-
-## Optional features
-
-`optional/` holds opt-in code that is not part of the core service or the Docker image:
-
-- `optional/annotate/`: a `/annotate` route that streams the uploaded image back with boxes drawn on it. See its README to enable it.
-
-## Use the AI skill
-
-The skill lives in `.claude/skills/fastapi-model-service/`. Open the repo root in Claude Code and it loads automatically when your request matches its description.
-
-Example prompts:
-
-- "Adapt this template to serve a ViT image classifier. Return the top 5 labels with scores."
-- "Enable the optional `/annotate` endpoint from `optional/annotate/`."
-- "The container keeps restarting after deploy. Help me debug it."
-
-After the AI finishes, review the diff. It should touch only the swap points. If it edits the lifespan code or the workflow, reject the change and tighten the wording in `SKILL.md`.
-
-When you hit a new class of failure, add a general pattern to `references/failure-patterns.md`.
+```
+app/
+  main.py          # lifespan, app.state, setup_errors, router registration
+  config.py        # loads and validates config.yaml (unknown keys rejected)
+  routers/         # thin HTTP layer (health.py, predict.py, annotate.py)
+  pipeline/        # detection/ (preprocess.py, postprocess.py) for RF-DETR
+  services/        # onnx_runtime.py: ONNX Runtime session, provider fallback, CUDA library preload
+  schemas/         # request and response models
+  utils/           # upload and image validation, box drawing
+config.yaml        # model and inference settings
+models/            # .onnx goes here (git keeps only .gitkeep)
+tests/
+  unit/            # run on every push, no model needed
+  integration/     # run against a live container, skip unless BASE_URL is set
+docs/first-time-setup.md
+Dockerfile
+requirements.txt       # shared runtime dependencies
+requirements-gpu.txt   # + onnxruntime-gpu with CUDA/cuDNN wheels (Docker image)
+requirements-dev.txt   # + CPU onnxruntime and test tools (local dev, CI unit tests)
+.github/workflows/ci.yml
+```
 
 ## CI/CD
 
 The workflow (`.github/workflows/ci.yml`) runs on every push to `main` and on every pull request:
 
-1. Installs dependencies and runs unit tests (always)
-2. Reads `model.url` and `model.path` from `config.yaml`, downloads the model with `wget`, and builds the Docker image
+1. Installs the CPU dependencies and runs unit tests
+2. Reads `model.url` and `model.path` from `config.yaml`, downloads the model with `wget`, and builds the GPU Docker image
 3. Starts the container, waits for `/ping`, and runs integration tests against it
 4. Pushes the image to Docker Hub, tagged with the commit SHA and `latest` (push to `main` only, never on pull requests)
 
-The model is set in `config.yaml`:
-
-```yaml
-model:
-  path: models/yolov8n.onnx   # CI downloads to this path. Must be under models/
-  url: https://huggingface.co/Kalray/yolov8/resolve/main/yolov8n.onnx
-```
-
-`model.url` must be a direct file link (a GitHub release asset or a Hugging Face `resolve/main/...` URL, not a web page). Models are never committed to git.
+GitHub-hosted runners have no GPU, so step 3 tests the GPU image on its CPU fallback, which also proves the no-GPU path works. It checks the endpoints and response shape, not GPU speed. The job summary lists the active providers. Check `/health` on your GPU host after deploying.
 
 Registry settings go under **Settings > Secrets and variables > Actions**:
 
 | Name | Kind | Value |
 |---|---|---|
 | `DOCKERHUB_USERNAME` | secret | Your registry username |
-| `DOCKERHUB_TOKEN` | secret | A registry access token |
-| `MODEL_URL` | repository variable (optional) | Overrides `model.url`, for example to test another model without a commit |
+| `DOCKERHUB_TOKEN` | secret | A registry access token with Read & Write access |
+| `MODEL_URL` | repository variable (optional) | Overrides `model.url`, for example to test another RF-DETR size without a commit |
 
 | Configured | What runs |
 |---|---|
-| No `model.url` | Unit tests only. The run is green and the job summary says what to set. |
 | `model.url`, no secrets | Unit tests, download, build, integration tests. Push is skipped. |
 | `model.url` and both secrets, push to `main` | Everything, and the image is pushed as `<username>/<repo>:<sha>` and `:latest`. |
 
-The job summary lists each stage's result, where the model came from, and why any stage was skipped.
-
-The Docker Hub image name is `<DOCKERHUB_USERNAME>/<GitHub repo name>`, lowercased. Docker Hub creates the repository on the first push (public unless your account default is private). The token needs Read & Write access.
-
-CI stops once the image is pushed. Deploying to a platform is a per-project step.
+The job summary lists each stage's result, where the model came from, and why any stage was skipped. The image name is `<DOCKERHUB_USERNAME>/<GitHub repo name>`, lowercased. Docker Hub creates the repository on the first push.
 
 ## Deploy
 
-Any platform that runs a container works. See `.claude/skills/fastapi-model-service/references/deployment.md` for the requirements.
-
-In short:
+Any platform that runs containers with NVIDIA GPUs works. See `.claude/skills/fastapi-model-service/references/deployment.md` for the requirements.
 
 - Deploy the pinned SHA tag, not `latest`
+- Give the container GPU access (`--gpus all`, or the platform's GPU setting)
 - Point the platform health check at `/ping`
-- Set required env vars on the platform
+- Confirm `/health` lists `CUDAExecutionProvider` first after deploy
 - Roll back by redeploying an earlier SHA tag
-- Record platform quirks in your project's README, not in the template
 
 ## Known limits
 
-- The template serves one model per service.
-- It has no authentication. Add it before exposing a service publicly.
-- Inference runs synchronously per request. Add a queue for long jobs.
+- One model per service.
+- No authentication. Add it before exposing the service publicly.
+- Inference runs synchronously per request, one image at a time. Add a queue or batching for high load.
+- The GPU image is several GB because it carries CUDA and cuDNN.
 
 ## License
 
-MIT. See `LICENSE`. The default model is Ultralytics YOLOv8n, which Ultralytics releases under AGPL-3.0. Check the model card and the license of any model you swap in.
+MIT. See `LICENSE`. RF-DETR Nano and its weights are Apache-2.0 (Roboflow). The ONNX export is from [PierreMarieCurie/rf-detr-onnx](https://github.com/PierreMarieCurie/rf-detr-onnx) (MIT).

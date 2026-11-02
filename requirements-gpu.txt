@@ -1,0 +1,4 @@
+# Docker image (Linux, NVIDIA GPU). The extras pull CUDA 12 and cuDNN 9 as pip
+# wheels, so the slim base image needs no system CUDA install.
+-r requirements.txt
+onnxruntime-gpu[cuda,cudnn]

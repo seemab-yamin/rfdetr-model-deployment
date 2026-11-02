@@ -1,8 +1,9 @@
+# Shared runtime dependencies. ONNX Runtime comes from requirements-gpu.txt
+# (Docker image) or requirements-dev.txt (local CPU dev and tests).
 fastapi
 uvicorn
 python-multipart
 pydantic>=2
 pyyaml
-onnxruntime
 numpy
 pillow

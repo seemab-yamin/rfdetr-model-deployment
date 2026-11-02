@@ -1,4 +1,7 @@
+# Local development and tests. CPU ONNX Runtime, since onnxruntime-gpu has no
+# macOS build. Never install both: they share the onnxruntime module.
 -r requirements.txt
+onnxruntime
 pytest
 httpx
 requests

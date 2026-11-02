@@ -1,6 +1,6 @@
 from app.pipeline.base import Pipeline, PipelineError
 from app.pipeline.detection.postprocess import postprocess
-from app.pipeline.detection.preprocess import letterbox, resolve_image_spec, to_tensor
+from app.pipeline.detection.preprocess import resize, resolve_image_spec, to_tensor
 
 
 class DetectionPipeline(Pipeline):
@@ -16,20 +16,21 @@ class DetectionPipeline(Pipeline):
         self.spec = resolve_image_spec(model.inputs[0], model_cfg.input_size)
 
     def preprocess(self, image):
-        canvas, ctx = letterbox(image, self.spec.height, self.spec.width)
+        canvas, ctx = resize(image, self.spec.height, self.spec.width)
         tensor = to_tensor(
             canvas,
             self.spec.layout,
             self.model_cfg.channel_order,
             self.model_cfg.normalize,
+            self.model_cfg.mean,
+            self.model_cfg.std,
         )
         return {self.spec.name: tensor}, ctx
 
     def postprocess(self, outputs, ctx):
         return postprocess(
-            outputs[0],
+            outputs,
             ctx,
             self.model_cfg.labels,
             self.inference_cfg.confidence_threshold,
-            self.inference_cfg.iou_threshold,
         )

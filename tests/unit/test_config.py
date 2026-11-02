@@ -43,3 +43,22 @@ def test_model_url_optional(tmp_path):
 def test_rejects_bad_model_url(tmp_path):
     with pytest.raises(ConfigError, match="model.url"):
         load_config(write(tmp_path, "model:\n  url: not-a-url\n"))
+
+
+def test_rejects_removed_iou_threshold(tmp_path):
+    with pytest.raises(ConfigError, match="iou_threshold"):
+        load_config(write(tmp_path, "inference:\n  iou_threshold: 0.45\n"))
+
+
+def test_providers_env_override(tmp_path, monkeypatch):
+    p = write(tmp_path, "inference:\n  providers: [CUDAExecutionProvider]\n  max_upload_mb: 3\n")
+    monkeypatch.setenv("INFERENCE_PROVIDERS", "CPUExecutionProvider")
+    s = load_config(p)
+    assert s.inference.providers == ["CPUExecutionProvider"]
+    assert s.inference.max_upload_mb == 3  # other keys kept
+
+    monkeypatch.setenv("INFERENCE_PROVIDERS", " CUDAExecutionProvider , CPUExecutionProvider ")
+    assert load_config(write(tmp_path, "")).inference.providers == [
+        "CUDAExecutionProvider",
+        "CPUExecutionProvider",
+    ]

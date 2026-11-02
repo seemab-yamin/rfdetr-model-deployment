@@ -1,5 +1,7 @@
-# CI: unit tests, then (when configured) download model, build image,
-# integration tests against the running container, and push to Docker Hub.
+# CI: unit tests (CPU onnxruntime), then download RF-DETR, build the GPU image
+# (onnxruntime-gpu), integration tests against the running container, and push
+# to Docker Hub. Runners have no GPU, so integration tests run the GPU image on
+# its CPU fallback. The job summary lists the active providers.
 # CI ends once the image is pushed. Deploying is a per-project step.
 #
 # The model comes from config.yaml: CI downloads model.url to model.path.
@@ -157,8 +159,11 @@ jobs:
           echo "Ready after $((SECONDS - deadline + 120))s"
 
           echo "/health:"
-          curl -s --max-time 5 http://localhost:8000/health
+          curl -s --max-time 5 http://localhost:8000/health | tee health.json
           echo
+          PROVIDERS=$(python -c "import json; print(', '.join(json.load(open('health.json'))['model_io']['providers']))")
+          echo "Active providers: $PROVIDERS"
+          echo "ACTIVE_PROVIDERS=$PROVIDERS" >> "$GITHUB_ENV"
 
           BASE_URL=http://localhost:8000 pytest tests/integration -v
 
@@ -217,6 +222,10 @@ jobs:
             HAS_MODEL="${HAS_MODEL:-false}"
             if [ "$HAS_MODEL" = "true" ]; then
               echo "- Model: \`$MODEL_PATH\` from $MODEL_SOURCE."
+              echo "- Image: GPU (onnxruntime-gpu), falls back to the next available provider when no GPU is visible."
+              if [ -n "${ACTIVE_PROVIDERS:-}" ]; then
+                echo "- Active providers in CI: \`$ACTIVE_PROVIDERS\`. Runners have no GPU, so CPU here is expected."
+              fi
             elif [ "${MODEL:-}" = "success" ]; then
               echo "- Build and integration tests skipped: model.url is not set in config.yaml. Set it to a direct download link to your .onnx file."
             fi

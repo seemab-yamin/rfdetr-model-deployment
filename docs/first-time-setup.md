@@ -5,45 +5,67 @@ app still runs, but `/ping` and `/predict` return 503 and `/health` lists what
 is missing in `setup_errors`. Complete this checklist first.
 
 ## Checklist
-1. Edit `config.yaml`: `model.path` (must be under `models/`), `model.url`
-   (a direct link to the `.onnx` file), `model.labels`, `model.input_size`,
-   `model.channel_order`, `model.normalize`.
-2. Locally, download the file to `model.path`, for example
-   `curl -fL -o models/yolov8n.onnx <model.url>`. In CI, the workflow
-   downloads `model.url` with `wget` for you.
-3. If your detector's output layout differs from YOLOv8 (cx, cy, w, h plus
-   class scores, shape (1, 4+classes, N)), edit
-   app/pipeline/detection/postprocess.py. If its input handling differs
-   (resize, color order, scaling), edit preprocess.py.
-   Check /health `model_io` to see your model's real input and output shapes.
+1. Install the CPU dev dependencies: `pip install -r requirements-dev.txt`.
+   Never install `requirements-gpu.txt` in the same environment: both ONNX
+   Runtime packages provide the `onnxruntime` module.
+2. Download RF-DETR Nano to `model.path`:
+   `curl -fL -o models/rf-detr-nano.onnx https://huggingface.co/PierreMarieCurie/rf-detr-onnx/resolve/main/rf-detr-nano.onnx`.
+   In CI, the workflow downloads `model.url` with `wget` for you.
+3. Start the server: `uvicorn app.main:app --reload`. The CPU runtime has no
+   `CUDAExecutionProvider`, so the log warns that it is skipped and the
+   service runs on CPU.
+4. Check `/health`: `model_loaded` is `true` and `model_io` shows input
+   `[1, 3, 384, 384]`, outputs `pred_boxes [1, 300, 4]` and
+   `pred_logits [1, 300, 91]`.
+5. Set the Docker Hub secrets in GitHub (see "CI" below) so CI pushes the GPU image.
 
-## Design rule
-When a design choice is open, follow the most common convention in the field.
+## GPU
+The Docker image installs `onnxruntime-gpu[cuda,cudnn]`, which brings CUDA 12
+and cuDNN 9 as pip wheels. `app/services/onnx_runtime.py` preloads them with
+`onnxruntime.preload_dlls()` when `CUDAExecutionProvider` is requested.
 
-## Adding a new task (NLP, tabular, other)
-1. Create app/pipeline/<task>/ with a Pipeline subclass (see app/pipeline/base.py).
-2. Register it in app/pipeline/__init__.py.
-3. Add the task name to the `task` Literal in app/config.py.
-4. Set `model.task` in config.yaml.
-5. Add unit tests that feed fake arrays and check the output.
-6. If the result shape differs from detections, add response models in
-   `app/schemas/` and a router in `app/routers/`.
-The runtime in app/services/onnx_runtime.py is task-agnostic. Do not edit it for a new task.
+Run the image with `docker run --gpus all ...` on a host with an NVIDIA
+driver and the NVIDIA Container Toolkit. Then check `/health`:
+`model_io.providers` lists the providers the session actually uses.
 
-## Detection layouts not covered by the reference
-YOLOv5 (has an objectness column), SSD, DETR and exports with NMS built in.
-Edit postprocess.py for these.
+| `model_io.providers` | Meaning |
+|---|---|
+| `[CUDAExecutionProvider, CPUExecutionProvider]` | Running on the GPU |
+| `[CPUExecutionProvider]` | GPU not visible: missing `--gpus all`, driver too old for CUDA 12, or toolkit not installed. The container logs show the CUDA error |
+
+Fallback order: the loader keeps the providers from `inference.providers` that
+this ONNX Runtime build has, in order, and always ends with CPU. ONNX Runtime
+then drops CUDA at session start if no GPU is visible. Either way the service
+starts, `/ping` turns 200, and `requested_providers` in `/health` shows what
+was asked for. To force CPU on a GPU host, set
+`INFERENCE_PROVIDERS=CPUExecutionProvider`.
+
+## Switching RF-DETR size
+Change `model.path` and `model.url` to another export from
+https://huggingface.co/PierreMarieCurie/rf-detr-onnx (use the `resolve/main/`
+link, not `blob/main/`). The input size comes from the model, so
+`model.input_size` only matters for dynamic inputs. Labels, normalization, and
+postprocessing are the same for all COCO detection sizes. Segmentation exports
+(`rf-detr-seg-*`) add a mask output that this service ignores.
+
+A fine-tuned RF-DETR with its own classes needs `model.labels` replaced with
+its class list, in model output order.
 
 ## Config fields
 See comments in `config.yaml`. Unknown keys are rejected on purpose.
-- `model.url` (optional, direct link): CI downloads the model from here to
+- `model.url` (direct link): CI downloads the model from here to
   `model.path`. The app itself never downloads it.
+- `model.mean`, `model.std`: ImageNet values. RF-DETR was trained with them.
+- `inference.providers`: priority order. Unavailable ones are skipped, CPU is the last resort. `INFERENCE_PROVIDERS` overrides it.
 - `inference.max_upload_mb` (int, default 10): `/predict` rejects larger uploads with 413.
 
 ## Calling /predict
 ```bash
-curl -F "file=@path/to/image.jpg" localhost:8000/predict
+curl -F "file=@data/sample/bus.jpg" localhost:8000/predict
 ```
+`/annotate` takes the same upload and returns the image with boxes drawn:
+`curl -F "file=@data/sample/bus.jpg" localhost:8000/annotate -o annotated.jpg`.
+
 Send one JPEG, PNG, or WebP image in the form field `file`. Until setup is
 complete, `/predict` returns 503 with the same `setup_errors` as `/health`.
 Fix those first. A 500 with a specific message (for example a labels count
@@ -51,20 +73,19 @@ mismatch) means `config.yaml` or `app/pipeline/` needs a change. See the
 README for the full error table.
 
 ## Mocks in unit tests
-Unit tests never need a real model.
-- `tests/unit/test_onnx_runtime.py` fakes ONNX input metadata and sessions.
+Unit tests never need a real model or a GPU.
+- `tests/unit/test_onnx_runtime.py` fakes ONNX metadata, sessions, and the CUDA preload.
 - `tests/unit/test_startup.py` patches `app.main.load_model` with a fake model.
+- `tests/unit/test_detection_pipeline.py` feeds fake RF-DETR outputs.
+- `tests/unit/test_annotate.py` uses a fake pipeline for `/annotate`.
 
-If you change the loader (for example to support multiple inputs), update
-these tests and the fakes to match. If you change the pipeline in
-`app/pipeline/`, add tests that feed fake arrays and check the output.
 Do not add a real .onnx file to the repo to make tests pass.
 
-## CI behavior with no model
+## CI
 The workflow in `.github/workflows/ci.yml` reads `model.url` and
-`model.path` from `config.yaml` and downloads the model with `wget` before
-building the image. Registry settings go under Settings > Secrets and
-variables > Actions:
+`model.path` from `config.yaml`, downloads the model with `wget`, builds the
+GPU image, and runs the integration tests against it. Registry settings go
+under Settings > Secrets and variables > Actions:
 
 | Name | Kind | Purpose |
 |---|---|---|
@@ -72,26 +93,11 @@ variables > Actions:
 | `DOCKERHUB_TOKEN` | secret | Registry access token |
 | `MODEL_URL` | repository variable (optional) | Overrides `model.url` without a commit |
 
-What runs:
-1. No `model.url`: unit tests only. Every other step is skipped and the run is green.
-2. `model.url` set: CI downloads the model to `model.path` (it must be under
-   `models/`), builds the image, starts it, waits for `/ping`, and runs
-   `tests/integration`. Push is skipped without the registry secrets.
-3. `model.url` and both secrets set, push to `main`: everything above, then
-   the image is pushed with the commit SHA tag and `latest`. Pull requests
-   never push.
+GitHub-hosted runners have no GPU, so the integration tests run the GPU image
+on ONNX Runtime's CPU fallback. They check endpoints and response shape, not
+GPU speed. Pushes to `main` with both secrets set push `<user>/<repo>:<sha>`
+and `:latest`. Pull requests never push.
 
-`model.url` must be a direct file link, such as a GitHub release asset or a
-Hugging Face `resolve/main/...` URL. A web page link downloads HTML, and the
-download step fails with a message naming where the URL came from. A file
-that downloads but is not a valid model fails at the `/ping` wait, and the
-log prints `/health` with `setup_errors` that say what is wrong.
-
-Reading the job summary: open the run, then the summary at the top of the
-page. It shows a table with each stage's result and one line for each skipped
-stage that names exactly what to configure, plus the model path and where
-its URL came from. After a push it shows the pushed
-image reference. Deploy the SHA tag, not `latest`.
-
-The integration tests only check the endpoints and response shape, not
-specific detections, because the template cannot know what your model finds.
+A file that downloads but is not a valid model fails at the `/ping` wait, and
+the log prints `/health` with `setup_errors` that say what is wrong. Deploy the
+SHA tag, not `latest`.

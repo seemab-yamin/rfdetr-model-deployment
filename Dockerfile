@@ -7,9 +7,11 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# Dependencies first so this layer is cached until requirements.txt changes
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Dependencies first so this layer is cached until the requirements change.
+# onnxruntime-gpu brings CUDA and cuDNN as pip wheels. Run with `--gpus all`
+# (NVIDIA Container Toolkit on the host). Without a GPU it falls back to CPU.
+COPY requirements.txt requirements-gpu.txt ./
+RUN pip install --no-cache-dir -r requirements-gpu.txt
 
 # The model arrives through the build context (CI downloads it into models/).
 # models/.gitkeep keeps this COPY working when no model is present.
