@@ -13,6 +13,8 @@ from pydantic import (
 )
 
 CONFIG_PATH = Path(os.getenv("CONFIG_PATH", "config.yaml"))
+# Comma-separated override for inference.providers, e.g. CPUExecutionProvider for local CPU dev
+PROVIDERS_ENV = "INFERENCE_PROVIDERS"
 
 
 class ConfigError(Exception):
@@ -30,6 +32,10 @@ class ModelConfig(_Section):
     input_size: tuple[int, int] = (640, 640)
     channel_order: Literal["RGB", "BGR"] = "RGB"
     normalize: bool = True
+    mean: tuple[float, float, float] | None = (
+        None  # per-channel, applied after normalize
+    )
+    std: tuple[float, float, float] | None = None
     labels: list[str] = Field(default_factory=list)
 
     @field_validator("path")
@@ -43,7 +49,6 @@ class ModelConfig(_Section):
 class InferenceConfig(_Section):
     providers: list[str] = ["CPUExecutionProvider"]
     confidence_threshold: float = Field(0.25, ge=0, le=1)
-    iou_threshold: float = Field(0.45, ge=0, le=1)
     max_upload_mb: int = Field(10, gt=0)
 
 
@@ -62,6 +67,9 @@ def load_config(path: Path = CONFIG_PATH) -> Settings:
         raw = yaml.safe_load(path.read_text()) or {}
     except yaml.YAMLError as e:
         raise ConfigError(f"{path} is not valid YAML: {e}") from e
+    if isinstance(raw, dict) and (env := os.getenv(PROVIDERS_ENV, "").strip()):
+        providers = [p.strip() for p in env.split(",") if p.strip()]
+        raw["inference"] = {**(raw.get("inference") or {}), "providers": providers}
     try:
         return Settings(**raw)
     except ValidationError as e:
