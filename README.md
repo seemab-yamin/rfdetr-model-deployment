@@ -214,13 +214,54 @@ The job summary lists each stage's result, where the model came from, and why an
 
 ## Deploy
 
-Any platform that runs containers with NVIDIA GPUs works. See `.claude/skills/fastapi-model-service/references/deployment.md` for the requirements.
+Any platform that runs containers with NVIDIA GPUs works:
 
 - Deploy the pinned SHA tag, not `latest`
 - Give the container GPU access (`--gpus all`, or the platform's GPU setting)
 - Point the platform health check at `/ping`
 - Confirm `/health` lists `CUDAExecutionProvider` first after deploy
 - Roll back by redeploying an earlier SHA tag
+
+### RunPod (Serverless, load-balancing endpoint)
+
+The service runs on a RunPod Serverless **load-balancing** endpoint. RunPod forwards plain HTTP to the FastAPI container, so `/predict`, `/annotate`, `/health`, and `/docs` work unchanged. No RunPod handler code is needed.
+
+| Setting | Value |
+|---|---|
+| Image | `<dockerhub-user>/rfdetr-model-deployment:<sha>` (pushed by CI from `main`) |
+| Endpoint type | Load balancing |
+| HTTP port | `8000` |
+| Health check | `/ping` on port `8000` (503 until the model loads, then 200) |
+| Workers | 2 |
+| Idle timeout | 60 s |
+| Request timeout | 60 s |
+| FlashBoot | Off |
+| Container disk | 10 GB (the image carries CUDA and cuDNN) |
+
+Every request needs a RunPod API key as a Bearer token. RunPod checks it at the gateway, before the request reaches the app:
+
+```bash
+curl -H "Authorization: Bearer $RUNPOD_API_KEY" https://<endpoint-id>.api.runpod.ai/health
+```
+
+```bash
+curl -H "Authorization: Bearer $RUNPOD_API_KEY" -F "file=@data/sample/bus.jpg" https://<endpoint-id>.api.runpod.ai/predict
+```
+
+```bash
+curl -H "Authorization: Bearer $RUNPOD_API_KEY" -F "file=@data/sample/bus.jpg" https://<endpoint-id>.api.runpod.ai/annotate -o annotated.jpg
+```
+
+After each deploy, check that `/health` → `model_io.providers` starts with `CUDAExecutionProvider`. If it lists only `CPUExecutionProvider`, the worker is not using the GPU (the service still answers, slowly).
+
+> **Tip: open `/docs` in the browser with ModHeader.** A browser cannot send the `Authorization` header, so RunPod rejects `/docs` and the `openapi.json` it loads. Install the ModHeader extension (Chrome or Firefox), add the request header `Authorization: Bearer <your RunPod API key>`, and set its URL filter to `https://<endpoint-id>.api.runpod.ai/*` so the key goes nowhere else. Then open `https://<endpoint-id>.api.runpod.ai/docs`. "Try it out" works too, since ModHeader adds the header to those calls. Swagger's own "Authorize" button does not help here: the gateway blocks the page before it loads. Turn the header off when you are done.
+
+Notes from the first deploy:
+
+- **Keep API keys out of files.** Use an env var such as `RUNPOD_API_KEY`. Rotate any key that was written to a file or pasted somewhere.
+- **Cold starts.** With FlashBoot off and workers scaling down after 60 s idle, the first request after idle waits for a worker to pull the multi-GB image and load the model. Keep the 60 s request timeout in mind for that first call, or turn on FlashBoot if cold starts matter.
+- **Model URL.** Use Hugging Face `resolve/main/...` links. `blob/main/...` downloads an HTML page, and CI's download check fails.
+- **Rollback.** Point the endpoint at an earlier SHA tag.
 
 ## Known limits
 
